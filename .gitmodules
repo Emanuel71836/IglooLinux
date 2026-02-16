@@ -1,0 +1,3 @@
+[submodule "modules/ice"]
+	path = modules/ice
+	url = https://github.com/Yrod0200/ice.git
