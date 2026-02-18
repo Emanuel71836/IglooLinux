@@ -1,3 +1,7 @@
 igloo_disk.img
-linux-6.12.13
+linux*
 mnt_igloo
+iso
+initramfs
+igloo-hd.qcow2
+igloolinux.iso

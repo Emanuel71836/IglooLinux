@@ -5,10 +5,14 @@ extern crate libc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::ffi::CString;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::ptr;
+use std::path::Path;
+use std::fs;
+use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
-// very cool signal handler
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SIGCHLD_RECEIVED: AtomicBool = AtomicBool::new(false);
 
@@ -89,7 +93,6 @@ fn mount_filesystems() {
     }
 }
 
-// kernel command line parser
 fn parse_cmdline(content: &str) {
     for token in content.split_whitespace() {
         if token.is_empty() {
@@ -105,14 +108,170 @@ fn parse_cmdline(content: &str) {
     }
 }
 
-fn process_cmdline() {
+fn read_cmdline() -> Option<String> {
     let mut cmdline = String::new();
     match File::open("/proc/cmdline").and_then(|mut f| f.read_to_string(&mut cmdline)) {
-        Ok(_) => parse_cmdline(&cmdline),
-        Err(e) => log_warn!("Failed to read /proc/cmdline: {}", e),
+        Ok(_) => Some(cmdline),
+        Err(e) => {
+            log_warn!("Failed to read /proc/cmdline: {}", e);
+            None
+        }
     }
 }
 
+fn parse_cmdline_for_root(content: &str) -> Option<String> {
+    for token in content.split_whitespace() {
+        if let Some(eq_pos) = token.find('=') {
+            let (key, value) = token.split_at(eq_pos);
+            if key == "root" && value[1..].starts_with("PARTUUID=") {
+                let partuuid = &value[1..]["PARTUUID=".len()..];
+                return Some(partuuid.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn find_device_by_partuuid(uuid: &str) -> Option<String> {
+    let path = format!("/dev/disk/by-partuuid/{}", uuid.to_lowercase());
+    if let Ok(canonical) = fs::canonicalize(&path) {
+        canonical.to_str().map(|s| s.to_string())
+    } else {
+        None
+    }
+}
+
+fn find_root_by_label(label: &str) -> Option<String> {
+    let block_dir = Path::new("/sys/block");
+    if !block_dir.exists() {
+        return None;
+    }
+
+    for entry in fs::read_dir(block_dir).ok()? {
+        let entry = entry.ok()?;
+        let dev_name = entry.file_name();
+        let dev_name = dev_name.to_string_lossy();
+
+        let part_dir = entry.path();
+        for part_entry in fs::read_dir(part_dir).ok()? {
+            let part_entry = part_entry.ok()?;
+            let part_name = part_entry.file_name();
+            let part_name = part_name.to_string_lossy();
+            if !part_name.starts_with(dev_name.as_ref()) {
+                continue;
+            }
+
+            let part_path = format!("/dev/{}", part_name);
+            let output = Command::new("blkid")
+                .arg("-s")
+                .arg("LABEL")
+                .arg("-o")
+                .arg("value")
+                .arg(&part_path)
+                .output()
+                .ok()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let label_found = stdout.trim();
+            if label_found == label {
+                return Some(part_path);
+            }
+        }
+    }
+    None
+}
+
+// switch root logic
+fn move_mount(oldpath: &str, newpath: &str) -> bool {
+    let c_old = CString::new(oldpath).expect("CString::new failed");
+    let c_new = CString::new(newpath).expect("CString::new failed");
+    let ret = unsafe { libc::mount(c_old.as_ptr(), c_new.as_ptr(), ptr::null(), libc::MS_MOVE, ptr::null()) };
+    if ret == 0 {
+        true
+    } else {
+        let err = std::io::Error::last_os_error();
+        log_warn!("Failed to move mount from {} to {}: {}", oldpath, newpath, err);
+        false
+    }
+}
+
+fn try_switch_root(device: &str) -> bool {
+    log_info!("Attempting to switch root to device {}", device);
+
+    if let Err(e) = fs::create_dir("/newroot") {
+        log_warn!("Failed to create /newroot: {}", e);
+        return false;
+    }
+
+    let fstypes = ["ext4", "ext3", "ext2", "btrfs", "xfs", "vfat"];
+    let mut mounted = false;
+    for fstype in &fstypes {
+        if mount_fs(device, "/newroot", fstype, libc::MS_RDONLY, "") {
+            mounted = true;
+            break;
+        }
+    }
+    if !mounted {
+        log_warn!("Could not mount {} with any known filesystem", device);
+        return false;
+    }
+
+    if !move_mount("/proc", "/newroot/proc") { return false; }
+    if !move_mount("/sys", "/newroot/sys") { return false; }
+    if !move_mount("/dev", "/newroot/dev") { return false; }
+
+    if let Err(e) = fs::create_dir("/newroot/oldroot") {
+        log_warn!("Failed to create /newroot/oldroot: {}", e);
+        return false;
+    }
+
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_pivot_root,
+            CString::new("/newroot").unwrap().as_ptr(),
+            CString::new("/newroot/oldroot").unwrap().as_ptr(),
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        log_warn!("pivot_root failed: {}", err);
+        return false;
+    }
+
+    if let Err(e) = std::env::set_current_dir("/") {
+        log_warn!("chdir to / after pivot_root failed: {}", e);
+        return false;
+    }
+
+    let c_oldroot = CString::new("/oldroot").unwrap();
+    unsafe {
+        libc::umount2(c_oldroot.as_ptr(), libc::MNT_DETACH);
+    }
+
+    log_info!("Switched root successfully, executing /sbin/init");
+    let init_path = CString::new("/sbin/init").unwrap();
+    let init_name = CString::new("init").unwrap();
+    let args = [init_name.as_ptr(), ptr::null()];
+    unsafe {
+        libc::execvp(init_path.as_ptr(), args.as_ptr());
+    }
+    let err = std::io::Error::last_os_error();
+    log_error!("execvp /sbin/init failed: {}", err);
+    false
+}
+
+fn exec_init_from_initrd() -> ! {
+    let init_path = CString::new("/sbin/init").unwrap();
+    let init_name = CString::new("init").unwrap();
+    let args = [init_name.as_ptr(), ptr::null()];
+    unsafe {
+        libc::execvp(init_path.as_ptr(), args.as_ptr());
+    }
+    let err = std::io::Error::last_os_error();
+    log_error!("execvp /sbin/init from initrd failed: {}", err);
+    fatal_error("Cannot start init from initrd");
+}
+
+// console handler (for init's own logging)
 fn open_console() {
     let path = CString::new("/dev/console").expect("CString::new failed");
     let fd = unsafe {
@@ -131,6 +290,7 @@ fn open_console() {
     log_info!("Opened /dev/console for logging");
 }
 
+// signal handling
 extern "C" fn sigterm_handler(_signo: libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
 }
@@ -155,59 +315,158 @@ fn setup_signals() {
     }
 }
 
-const SHELL_PATH: &str = "/bin/bash";
+// shell spawner – now takes a TTY path
+const SHELL_PATHS: &[&str] = &["/bin/bash", "/bin/sh"];
 
-fn spawn_shell() -> Option<libc::pid_t> {
+fn decode_status(status: i32) -> String {
+    {
+        if libc::WIFEXITED(status) {
+            format!("exited with code {}", libc::WEXITSTATUS(status))
+        } else if libc::WIFSIGNALED(status) {
+            format!("terminated by signal {}", libc::WTERMSIG(status))
+        } else if libc::WIFSTOPPED(status) {
+            format!("stopped by signal {}", libc::WSTOPSIG(status))
+        } else {
+            format!("unknown status {}", status)
+        }
+    }
+}
+
+fn spawn_shell(tty_path: &str) -> Option<libc::pid_t> {
+    // log which shells are available for debugging
+    for p in SHELL_PATHS {
+        if Path::new(p).exists() {
+            log_info!("Found shell: {}", p);
+        } else {
+            log_warn!("Shell not found: {}", p);
+        }
+    }
+
+    // find first available shell
+    let shell_path = SHELL_PATHS.iter().find(|&&p| Path::new(p).exists())?;
+    let shell_path_str = *shell_path;
+
+    // set environment for the shell and any child processes
     std::env::set_var("PATH", "/sbin:/usr/sbin:/bin:/usr/bin");
+    std::env::set_var("TERM", "linux");
+    std::env::set_var("HOME", "/");
+    std::env::set_var("USER", "root");
+    std::env::set_var("LD_LIBRARY_PATH", "/lib/x86_64-linux-gnu:/lib64");
 
     unsafe {
         let pid = libc::fork();
         if pid == 0 {
+            // child process
             libc::setsid();
 
-            let path = CString::new("/dev/console").expect("CString failed");
+            let path = CString::new(tty_path).expect("CString failed");
             let fd = libc::open(path.as_ptr(), libc::O_RDWR);
             
             if fd >= 0 {
+                // make it the controlling terminal
                 libc::ioctl(fd, libc::TIOCSCTTY as _, 1);
                 
+                // duplicate to stdin, stdout, stderr
                 libc::dup2(fd, 0);
                 libc::dup2(fd, 1);
                 libc::dup2(fd, 2);
                 
+                // write a test message to confirm the tty works
+                let msg = format!("Shell starting on {}...\n", tty_path);
+                libc::write(fd, msg.as_ptr() as *const _, msg.len());
+                
                 if fd > 2 { libc::close(fd); }
+            } else {
+                let msg = format!("Failed to open {}!\n", tty_path);
+                libc::write(1, msg.as_ptr() as *const _, msg.len());
+                libc::_exit(1);
             }
 
+            // set the foreground process group on the terminal (fd 0)
             let pgrp = libc::getpid();
             libc::tcsetpgrp(0, pgrp);
 
-            let shell_path = CString::new(SHELL_PATH).expect("CString failed");
-            let shell_name = CString::new("bash").expect("CString failed");
+            // prepare exec arguments
+            let shell_cstr = CString::new(shell_path_str).expect("CString failed");
+            let shell_name = CString::new("sh").expect("CString failed");
+            let args = [shell_name.as_ptr(), ptr::null()];
 
-            let args = [
-                shell_name.as_ptr(),
-                ptr::null()
-            ];
-
-            libc::execvp(shell_path.as_ptr(), args.as_ptr());
-            libc::_exit(1);
+            libc::execvp(shell_cstr.as_ptr(), args.as_ptr());
+            // if exec fails, exit with error
+            libc::_exit(127);
         } else if pid > 0 {
-            log_info!("Spawned shell (PID {})", pid);
+            log_info!("Spawned shell on {} (PID {})", tty_path, pid);
             Some(pid)
         } else {
+            log_warn!("fork failed for {}", tty_path);
             None
         }
     }
 }
 
-fn main_loop() {
-    let mut child_pid = match spawn_shell() {
-        Some(pid) => pid,
-        None => {
-            fatal_error("Cannot start shell");
-        }
-    };
+// network initialisation (DHCP/DNS)
+fn setup_dns() -> std::io::Result<()> {
+    fs::create_dir_all("/etc")?;
+    let mut file = File::create("/etc/resolv.conf")?;
+    file.write_all(b"nameserver 8.8.8.8\nnameserver 1.1.1.1\n")?;
+    Ok(())
+}
 
+fn init_network() {
+    log_info!("Initializing network...");
+    // set library path for all external commands
+    std::env::set_var("LD_LIBRARY_PATH", "/lib/x86_64-linux-gnu:/lib64");
+    std::env::set_var("PATH", "/sbin:/usr/sbin:/bin:/usr/bin");
+
+    // bring up loopback
+    match Command::new("ip").args(&["link", "set", "lo", "up"]).status() {
+        Ok(status) if status.success() => log_info!("Loopback up"),
+        Ok(status) => log_warn!("ip link set lo up failed with status: {}", status),
+        Err(e) => log_warn!("Failed to execute ip for loopback: {}", e),
+    }
+
+    match Command::new("ip").args(&["link", "set", "eth0", "up"]).status() {
+        Ok(status) if status.success() => log_info!("eth0 up"),
+        Ok(status) => log_warn!("ip link set eth0 up failed with status: {}", status),
+        Err(e) => log_warn!("Failed to execute ip for eth0: {}", e),
+    }
+
+    let dhcp_clients = [("udhcpc", &["-i", "eth0"][..]), ("dhcpcd", &["eth0"][..])];
+    for (cmd, args) in &dhcp_clients {
+        log_info!("Trying {}...", cmd);
+        match Command::new(cmd).args(*args).spawn() {
+            Ok(mut _child) => {
+                log_info!("Spawned {}", cmd);
+                break;
+            }
+            Err(e) => log_warn!("Failed to execute {}: {}", cmd, e),
+        }
+    }
+
+    if let Err(e) = setup_dns() {
+        log_warn!("Failed to write /etc/resolv.conf: {}", e);
+    } else {
+        log_info!("/etc/resolv.conf written with static DNS servers");
+    }
+
+    thread::sleep(Duration::from_secs(2));
+
+    match Command::new("ip").arg("route").arg("show").output() {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                log_info!("Route: {}", line);
+            }
+            if stdout.is_empty() {
+                log_warn!("No routes found – default gateway may be missing.");
+            }
+        }
+        Ok(output) => log_warn!("ip route show failed with status: {}", output.status),
+        Err(e) => log_warn!("Failed to execute ip route show: {}", e),
+    }
+}
+
+fn main_loop(pid_tty0: &mut libc::pid_t, pid_tty_s0: &mut libc::pid_t) {
     loop {
         if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
             log_info!("Shutdown requested, powering off");
@@ -231,15 +490,39 @@ fn main_loop() {
                     break;
                 }
 
-                if pid == child_pid {
-                    log_info!("Shell (PID {}) exited with status {}, respawning...", child_pid, status);
-                    match spawn_shell() {
-                        Some(new_pid) => child_pid = new_pid,
-                        None => fatal_error("Cannot respawn shell"),
+                if pid == *pid_tty0 {
+                    let reason = decode_status(status);
+                    log_info!("Shell on /dev/tty0 (PID {}) {} – respawning...", pid, reason);
+                    if let Some(new_pid) = spawn_shell("/dev/tty0") {
+                        *pid_tty0 = new_pid;
+                    } else {
+                        *pid_tty0 = -1;
+                        log_error!("Failed to respawn shell on /dev/tty0");
+                    }
+                } else if pid == *pid_tty_s0 {
+                    let reason = decode_status(status);
+                    log_info!("Shell on /dev/ttyS0 (PID {}) {} – respawning...", pid, reason);
+                    if let Some(new_pid) = spawn_shell("/dev/ttyS0") {
+                        *pid_tty_s0 = new_pid;
+                    } else {
+                        *pid_tty_s0 = -1;
+                        log_error!("Failed to respawn shell on /dev/ttyS0");
                     }
                 } else {
-                    log_info!("Reaped child process {}", pid);
+                    let reason = decode_status(status);
+                    log_info!("Reaped child process {}: {}", pid, reason);
                 }
+            }
+        }
+
+        if *pid_tty0 == -1 {
+            if let Some(pid) = spawn_shell("/dev/tty0") {
+                *pid_tty0 = pid;
+            }
+        }
+        if *pid_tty_s0 == -1 {
+            if let Some(pid) = spawn_shell("/dev/ttyS0") {
+                *pid_tty_s0 = pid;
             }
         }
 
@@ -247,7 +530,6 @@ fn main_loop() {
     }
 }
 
-// PC shutdown
 fn shutdown() -> ! {
     log_info!("Initiating system power-off");
     unsafe {
@@ -260,18 +542,55 @@ fn shutdown() -> ! {
     fatal_error("Shutdown failed – now sleeping forever");
 }
 
-// entry point
 fn main() {
+    std::env::set_var("LD_LIBRARY_PATH", "/lib/x86_64-linux-gnu:/lib64");
+
     mount_filesystems();
-    
+
+    // Read kernel command line
+    let cmdline = read_cmdline().unwrap_or_default();
+    parse_cmdline(&cmdline);
+
+    if let Some(uuid) = parse_cmdline_for_root(&cmdline) {
+        if let Some(device) = find_device_by_partuuid(&uuid) {
+            if try_switch_root(&device) {
+                // never returns on success
+            }
+        } else {
+            log_warn!("No device found for PARTUUID {}", uuid);
+        }
+    }
+
+    if let Some(device) = find_root_by_label("IGLOO_ROOT") {
+        log_info!("Found root partition by label: {}", device);
+        if try_switch_root(&device) {
+            // never returns
+        }
+    } else {
+        log_info!("No partition with label 'IGLOO_ROOT' found.");
+    }
+
+    if Path::new("/sbin/init").exists() {
+        log_info!("No root partition switched, executing /sbin/init from initrd");
+        exec_init_from_initrd(); // never returns
+    }
+
     unsafe {
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
     }
-
-    open_console();
-    process_cmdline();
+    open_console();               // for init's own logging
+    init_network();               // bring up network before entering main loop
     setup_signals();
-    main_loop();
+
+    // Spawn the two shells
+    let mut pid_tty0 = spawn_shell("/dev/tty0").unwrap_or(-1);
+    let mut pid_tty_s0 = spawn_shell("/dev/ttyS0").unwrap_or(-1);
+
+    if pid_tty0 == -1 && pid_tty_s0 == -1 {
+        fatal_error("Cannot start any shell");
+    }
+
+    main_loop(&mut pid_tty0, &mut pid_tty_s0);
     shutdown();
 }
