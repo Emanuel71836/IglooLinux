@@ -1,3 +1,6 @@
 [submodule "modules/ice"]
 	path = modules/ice
 	url = https://github.com/Emanuel71836/ice-igloo.git
+[submodule "external/pacman"]
+	path = external/pacman
+	url = https://gitlab.archlinux.org/pacman/pacman.git
