@@ -12,11 +12,13 @@ cp /lib64/ld-linux-x86-64.so.2 $DEST/lib64/
 mkdir -p $DEST/usr/lib/grub/x86_64-efi
 cp -r /usr/lib/grub/x86_64-efi/* $DEST/usr/lib/grub/x86_64-efi/
 
-# 4. SIMPLE GRUB CONFIG
 cat <<EOF > ./iso/boot/grub/grub.cfg
-set timeout=0
+set timeout=5
+insmod all_video
+set gfxpayload=keep
+
 menuentry "Igloo" {
-    linux /boot/vmlinuz root=LABEL=IGLOO_ROOT rw console=tty0 console=ttyS0
+    linux /boot/vmlinuz root=LABEL=IGLOO_ROOT rw console=tty1 nomodeset earlyprintk=vga panic=10
     initrd /boot/initrd.img
 }
 EOF

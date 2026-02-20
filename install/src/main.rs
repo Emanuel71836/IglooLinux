@@ -11,6 +11,8 @@ use tempfile::tempdir;
 
 const ROOT_LABEL: &str = "IGLOO_ROOT";
 const ESP_LABEL: &str = "EFI";
+// local path to the root filesystem tarball
+const ROOTFS_TARBALL_PATH: &str = "/iso/igloo-rootfs.tar.gz";
 
 #[derive(Debug, Clone, Copy)]
 enum BootMode {
@@ -32,6 +34,16 @@ struct Partition {
     fstype: Option<String>,
     label: Option<String>,
     mountpoint: Option<String>,
+}
+
+// handler to nvme disks
+fn partition_path(disk: &str, part_num: u32) -> String {
+    let disk_name = disk.trim_start_matches("/dev/");
+    if disk_name.chars().last().map_or(false, |c| c.is_ascii_digit()) {
+        format!("{}{}{}", disk, 'p', part_num)
+    } else {
+        format!("{}{}", disk, part_num)
+    }
 }
 
 fn list_disks() -> Vec<Disk> {
@@ -141,70 +153,28 @@ fn create_partitions(disk: &Disk, mode: BootMode) -> (String, Option<String>) {
         BootMode::Legacy => {
             println!("Creating MBR partition table and one Linux partition on {}...", disk.path);
 
-            let status = Command::new("parted")
-                .args(&["-s", &disk.path, "mklabel", "msdos"])
-                .status()
-                .expect("failed to run parted");
-            if !status.success() {
-                panic!("Failed to create MBR label");
-            }
-
-            let status = Command::new("parted")
-                .args(&["-s", &disk.path, "mkpart", "primary", "ext4", "0%", "100%"])
-                .status()
-                .expect("failed to run parted");
-            if !status.success() {
-                panic!("Failed to create partition");
-            }
-
+            run_command("parted", &["-s", &disk.path, "mklabel", "msdos"])
+                .expect("Failed to create MBR label");
+            run_command("parted", &["-s", &disk.path, "mkpart", "primary", "ext4", "0%", "100%"])
+                .expect("Failed to create partition");
             let _ = Command::new("partprobe").arg(&disk.path).status();
 
-            let root_part = if disk.path.contains("nvme") {
-                format!("{}p1", disk.path)
-            } else {
-                format!("{}1", disk.path)
-            };
+            let root_part = partition_path(&disk.path, 1);
             (root_part, None)
         }
         BootMode::Uefi => {
             println!("Creating GPT partition table, ESP, and root partition on {}...", disk.path);
 
-            let status = Command::new("sgdisk")
-                .args(&["--zap-all", &disk.path])
-                .status()
-                .expect("failed to run sgdisk");
-            if !status.success() {
-                panic!("Failed to wipe partition table");
-            }
-
-            let status = Command::new("sgdisk")
-                .args(&["-n", "1:0:+512M", "-t", "1:EF00", &disk.path])
-                .status()
-                .expect("failed to run sgdisk");
-            if !status.success() {
-                panic!("Failed to create ESP");
-            }
-
-            let status = Command::new("sgdisk")
-                .args(&["-n", "2:0:0", "-t", "2:8300", &disk.path])
-                .status()
-                .expect("failed to run sgdisk");
-            if !status.success() {
-                panic!("Failed to create root partition");
-            }
-
+            run_command("sgdisk", &["--zap-all", &disk.path])
+                .expect("Failed to wipe partition table");
+            run_command("sgdisk", &["-n", "1:0:+512M", "-t", "1:EF00", &disk.path])
+                .expect("Failed to create ESP");
+            run_command("sgdisk", &["-n", "2:0:0", "-t", "2:8300", &disk.path])
+                .expect("Failed to create root partition");
             let _ = Command::new("partprobe").arg(&disk.path).status();
 
-            let esp_part = if disk.path.contains("nvme") {
-                format!("{}p1", disk.path)
-            } else {
-                format!("{}1", disk.path)
-            };
-            let root_part = if disk.path.contains("nvme") {
-                format!("{}p2", disk.path)
-            } else {
-                format!("{}2", disk.path)
-            };
+            let esp_part = partition_path(&disk.path, 1);
+            let root_part = partition_path(&disk.path, 2);
             (root_part, Some(esp_part))
         }
     }
@@ -212,36 +182,20 @@ fn create_partitions(disk: &Disk, mode: BootMode) -> (String, Option<String>) {
 
 fn format_ext4(partition: &str, label: &str) {
     println!("Formatting {} as ext4 with label '{}'...", partition, label);
-    let status = Command::new("mkfs.ext4")
-        .args(&["-F", "-L", label, partition])
-        .status()
-        .expect("failed to run mkfs.ext4");
-    if !status.success() {
-        panic!("Formatting failed");
-    }
+    run_command("mkfs.ext4", &["-F", "-L", label, partition])
+        .expect("Formatting failed");
 }
 
 fn set_label(partition: &str, label: &str) {
     println!("Setting label on {} to '{}'...", partition, label);
-    let status = Command::new("e2label")
-        .arg(partition)
-        .arg(label)
-        .status()
-        .expect("failed to run e2label");
-    if !status.success() {
-        panic!("Setting label failed");
-    }
+    run_command("e2label", &[partition, label])
+        .expect("Setting label failed");
 }
 
 fn format_efi(partition: &str, label: &str) {
     println!("Formatting {} as FAT32 with label '{}'...", partition, label);
-    let status = Command::new("mkfs.vfat")
-        .args(&["-F", "32", "-n", label, partition])
-        .status()
-        .expect("failed to run mkfs.vfat");
-    if !status.success() {
-        panic!("Formatting ESP failed");
-    }
+    run_command("mkfs.vfat", &["-F", "32", "-n", label, partition])
+        .expect("Formatting ESP failed");
 }
 
 fn configure_network() {
@@ -269,15 +223,7 @@ fn populate_initramfs_from_live(initramfs_root: &Path) -> std::io::Result<()> {
         }
         let dst = initramfs_root.join(dir.trim_start_matches('/'));
         println!("Copying {} to initramfs...", dir);
-        let status = Command::new("cp")
-            .arg("-a")
-            .arg(src)
-            .arg(&dst)
-            .status()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("cp failed for {}: {}", dir, e)))?;
-        if !status.success() {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("cp failed for {}", dir)));
-        }
+        run_command("cp", &["-a", dir, dst.to_str().unwrap()])?;
     }
     Ok(())
 }
@@ -396,21 +342,7 @@ fn install_grub(mode: BootMode, disk: &str, esp_mount: Option<&str>) -> std::io:
     match mode {
         BootMode::Legacy => {
             println!("Installing GRUB (i386-pc) to {}...", disk);
-            let status = Command::new("grub-install")
-                .args(&["--target=i386-pc", "--boot-directory=/mnt/boot", disk])
-                .status()
-                .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("grub-install failed: {}", e),
-                    )
-                })?;
-            if !status.success() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "grub-install returned non-zero status",
-                ));
-            }
+            run_command("grub-install", &["--target=i386-pc", "--boot-directory=/mnt/boot", disk])?;
         }
         BootMode::Uefi => {
             println!("Installing GRUB (x86_64-efi) to {}...", disk);
@@ -420,27 +352,16 @@ fn install_grub(mode: BootMode, disk: &str, esp_mount: Option<&str>) -> std::io:
                     "ESP mount point not provided for UEFI install",
                 )
             })?;
-            let status = Command::new("grub-install")
-                .args(&[
+            run_command(
+                "grub-install",
+                &[
                     "--target=x86_64-efi",
                     "--efi-directory",
                     efi_dir,
                     "--boot-directory=/mnt/boot",
                     "--removable",
-                ])
-                .status()
-                .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("grub-install failed: {}", e),
-                    )
-                })?;
-            if !status.success() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "grub-install returned non-zero status",
-                ));
-            }
+                ],
+            )?;
         }
     }
 
@@ -459,6 +380,63 @@ menuentry "Igloo Linux" {
     Ok(())
 }
 
+/// retrieve the UUID of a partition using blkid.
+fn get_uuid(partition: &str) -> std::io::Result<String> {
+    let output = Command::new("blkid")
+        .args(&["-s", "UUID", "-o", "value", partition])
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("blkid failed for {}", partition),
+        ));
+    }
+    let uuid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if uuid.is_empty() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("no UUID found for {}", partition),
+        ))
+    } else {
+        Ok(uuid)
+    }
+}
+
+/// helper to run a command and convert non‑zero exit to an io::Error
+fn run_command(cmd: &str, args: &[&str]) -> std::io::Result<()> {
+    let status = Command::new(cmd)
+        .args(args)
+        .status()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("failed to execute {}: {}", cmd, e)))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("{} exited with status {}", cmd, status),
+        ))
+    }
+}
+
+/// extract the root filesystem tarball from a local path into the target root
+fn extract_rootfs_tarball(target_root: &str) -> std::io::Result<()> {
+    println!("Extracting root filesystem from {} ...", ROOTFS_TARBALL_PATH);
+
+    // check that the tarball exists
+    if !Path::new(ROOTFS_TARBALL_PATH).exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Root filesystem tarball not found at {}", ROOTFS_TARBALL_PATH),
+        ));
+    }
+
+    // extract the tarball directly into target_root
+    run_command("tar", &["-xzf", ROOTFS_TARBALL_PATH, "-C", target_root])?;
+
+    println!("Root filesystem extracted successfully.");
+    Ok(())
+}
+
 fn install_system(
     mode: BootMode,
     root_part: &str,
@@ -466,72 +444,41 @@ fn install_system(
 ) -> std::io::Result<()> {
     fs::create_dir_all("/mnt")?;
 
+    // mount root partition
     println!("Mounting {} to /mnt...", root_part);
-    let status = Command::new("mount")
-        .arg(root_part)
-        .arg("/mnt")
-        .status()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("mount failed: {}", e)))?;
-    if !status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "mount command failed",
-        ));
-    }
+    run_command("mount", &[root_part, "/mnt"])?;
 
+    // mount esp if present
     if let Some(esp) = esp_part {
         println!("Mounting {} to /mnt/boot/efi...", esp);
         fs::create_dir_all("/mnt/boot/efi")?;
-        let status = Command::new("mount")
-            .arg(esp)
-            .arg("/mnt/boot/efi")
-            .status()
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("mount ESP failed: {}", e),
-                )
-            })?;
-        if !status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "mount ESP failed",
-            ));
-        }
+        run_command("mount", &[esp, "/mnt/boot/efi"])?;
     }
 
-    let dirs = ["/bin", "/boot", "/etc", "/lib", "/lib64", "/usr"];
-    for dir in &dirs {
-        println!("Copying {}...", dir);
-        let status = Command::new("cp")
-            .arg("-a")
-            .arg(dir)
-            .arg("/mnt/")
-            .status()
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("cp failed for {}: {}", dir, e),
-                )
-            })?;
-        if !status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("cp failed for {}", dir),
-            ));
-        }
-    }
+    // extract root filesystem from local tarball
+    extract_rootfs_tarball("/mnt")?;
 
-    println!("Creating /etc/fstab...");
-    let fstab_content = format!(
-        "# /etc/fstab: static file system information\n\
-         LABEL={} / ext4 defaults 0 1\n",
-        ROOT_LABEL
-    );
-    fs::write("/mnt/etc/fstab", fstab_content)?;
+    // obtain UUIDs for the partitions
+    let root_uuid = get_uuid(root_part)?;
+    let esp_uuid = if let Some(esp) = esp_part {
+        Some(get_uuid(esp)?)
+    } else {
+        None
+    };
+
+    // write /etc/fstab with UUIDs
+    println!("Creating /etc/fstab with UUIDs...");
+    let mut fstab = String::new();
+    fstab.push_str("# /etc/fstab: static file system information\n");
+    fstab.push_str(&format!("UUID={} / ext4 rw,relatime 0 1\n", root_uuid));
+    if let Some(uuid) = esp_uuid {
+        fstab.push_str(&format!("UUID={} /boot/efi vfat defaults 0 2\n", uuid));
+    }
+    fs::write("/mnt/etc/fstab", fstab)?;
 
     create_initramfs("/mnt")?;
 
+    // install grub
     let esp_mount = if matches!(mode, BootMode::Uefi) {
         Some("/mnt/boot/efi")
     } else {
@@ -542,41 +489,14 @@ fn install_system(
         .trim_end_matches('p');
     install_grub(mode, disk, esp_mount)?;
 
+    // unmount
     println!("Syncing and unmounting...");
     Command::new("sync").status().ok();
 
     if esp_part.is_some() {
-        let status = Command::new("umount")
-            .arg("/mnt/boot/efi")
-            .status()
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("umount ESP failed: {}", e),
-                )
-            })?;
-        if !status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "umount ESP failed",
-            ));
-        }
+        run_command("umount", &["/mnt/boot/efi"])?;
     }
-    let status = Command::new("umount")
-        .arg("/mnt")
-        .status()
-        .map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("umount root failed: {}", e),
-            )
-        })?;
-    if !status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "umount root failed",
-        ));
-    }
+    run_command("umount", &["/mnt"])?;
 
     println!("System installed successfully on {}", root_part);
     Ok(())
